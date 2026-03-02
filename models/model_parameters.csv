@@ -1,5 +1,21 @@
-"model_name","track","pretrained_model","L1","component_order","batch_size","learning_rate","weight_decay","warmup_ratio","epochs"
-"baseline_open_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5"
-"baseline_closed_cn","closed","xlm-roberta-base","cn","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5"
-"baseline_closed_de","closed","xlm-roberta-base","de","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0","0.1","5"
-"baseline_closed_es","closed","xlm-roberta-base","es","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5"
+"model_name","track","pretrained_model","L1","component_order","batch_size","learning_rate","weight_decay","warmup_ratio","epochs","latent_dim","annealing_factor","dropout","pred_head","layer_wise","token_wise","pos_encoding","learned_pos","max_seq_len"
+"baseline_open_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1",
+"baseline_closed_cn","closed","xlm-roberta-base","cn","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1",
+"baseline_closed_de","closed","xlm-roberta-base","de","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0","0.1","5","64","1e-3","0.1",
+"baseline_closed_es","closed","xlm-roberta-base","es","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1",
+"mlp_ScalarMix_AddAttn_large_xx","open","xlm-roberta-large","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","ScalarMix","AddAttn","","","128"
+"mlp_ScalarMix_SelfAttn_large_xx","open","xlm-roberta-large","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","ScalarMix","SelfAttn","","","128"
+"mlp_ScalarMix_AddAttn_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","ScalarMix","AddAttn","","","128"
+"mlp_AddAttn_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","","AddAttn","","","128"
+"vib_AddAttn_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","vib","","AddAttn","","","128"
+"mlp_SelfAttn_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","","SelfAttn","","","128"
+"mlp_SelfAttn_pos_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","","SelfAttn","1","","128"
+"mlp_SelfAttn_Lpos_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","","SelfAttn","1","1","128"
+"mlp_ScalarMix_SelfAttn_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","ScalarMix","SelfAttn","","","128"
+"mlp_ScalarMix_SelfAttn_pos_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","ScalarMix","SelfAttn","1","","128"
+"mlp_ScalarMix_SelfAttn_Lpos_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1","mlp","ScalarMix","SelfAttn","1","1","128"
+"Ensembled_cn","closed","xlm-roberta-base","cn","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1",
+"Ensembled_de","closed","xlm-roberta-base","de","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0","0.1","5","64","1e-3","0.1",
+"Ensembled_es","closed","xlm-roberta-base","es","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1",
+"Ensembled_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1",
+"Ensembled_vib_xx","open","xlm-roberta-base","xx","L1_source_word; L1_context; en_target_clue; en_target_word","32","0.00003","0.1","0.1","5","64","1e-3","0.1",

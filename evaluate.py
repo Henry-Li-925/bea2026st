@@ -72,6 +72,20 @@ def run_evaluate(dataset_split):
                 how="left"
             )
 
+            # --- SAFETY CHECK FOR CUSTOM MODELS ---
+            # VAEs or custom heads can sometimes output NaNs if training diverged.
+            # We remove them to prevent metric calculation errors.
+            initial_len = len(merged_df)
+            merged_df = merged_df.dropna(subset=["prediction", "GLMM_score"])
+            
+            if len(merged_df) < initial_len:
+                logging.warning(f"Dropped {initial_len - len(merged_df)} rows with NaN values in {model_name}")
+
+            if len(merged_df) == 0:
+                logging.error(f"No valid predictions remaining for {model_name}. Skipping.")
+                continue
+            # --------------------------------------
+
             # Compute metrics and store results
             labels = merged_df["GLMM_score"].values
             predictions = merged_df["prediction"].values

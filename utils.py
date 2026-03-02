@@ -9,6 +9,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
+
+from torch.optim import AdamW
 from sklearn.metrics import root_mean_squared_error
 from scipy.stats import pearsonr
 from transformers import logging as hf_logging
@@ -202,7 +204,7 @@ def preprocess_dataset(ds_dict, cols_to_merge, sep_token):
     Preprocess a Hugging Face DatasetDict by:
         1. Merging specified text columns into a single 'input_text' column.
         2. Renaming the target column 'GLMM_score' to 'label'.
-        3. Removing all other columns except 'input_text' and 'label'.
+        3. Removing all other columns except 'input_text', 'l1' and 'label'.
 
     Args:
         ds_dict (datasets.DatasetDict): Input DatasetDict with one or more splits.
@@ -217,7 +219,7 @@ def preprocess_dataset(ds_dict, cols_to_merge, sep_token):
     # Compute columns to remove
     first_split = next(iter(ds_dict.values())) # get first key in ds_dict
     all_columns = first_split.column_names
-    cols_to_keep = ["input_text", "label"]
+    cols_to_keep = ["input_text", "L1", "label"]
     cols_to_remove = [c for c in all_columns if c not in cols_to_keep and c != 'GLMM_score']
     
     # Format input text, rename target label and remove extra columns
@@ -242,6 +244,10 @@ def compute_metrics(eval_pred):
         dict: Dictionary containing RMSE and Pearson correlation.
     """
     predictions, labels=eval_pred
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+    if isinstance(labels, tuple):
+        labels = labels[0]
     predictions = predictions.flatten() # shape (num_examples,)
     rmse = root_mean_squared_error(labels, predictions)
     p_corr, _ = pearsonr(predictions, labels)
@@ -329,3 +335,34 @@ def cleanup_trainer_memory(*objects):
         torch.mps.empty_cache()
     for obj in objects:
         del obj
+
+
+def custom_optimizer(model, base_lr, weight_decay, acc_lr=1e-3):
+    # Separate the parameters into two groups
+    backbone_params = []
+    head_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # If the layer name contains 'backbone', it goes to the slow group
+        if 'ScalarMix' in name or 'mlp' in name:
+            head_params.append(param)
+        # Otherwise (mlp, scalar_mix), it goes to the fast group
+        else:
+            backbone_params.append(param)
+
+    # Assign the differential learning rates
+    optimizer_grouped_parameters = [
+        {
+            "params": backbone_params, 
+            "lr": base_lr 
+        },  
+        {
+            "params": head_params, 
+            "lr": acc_lr   
+        }       
+    ]
+
+    # 4. Initialize the custom optimizer
+    return AdamW(optimizer_grouped_parameters, weight_decay=weight_decay)

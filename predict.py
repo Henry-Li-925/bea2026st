@@ -19,6 +19,9 @@ from utils import (
     cleanup_trainer_memory
 )
 
+from cvae import XLMRobertaCVAE, CVAEDataCollator
+from models import CloseTrack_Predictor
+
 # Fixed paths 
 DATA_DIR = Path("data/")
 MODELS_DIR = Path("models/")
@@ -50,6 +53,25 @@ def run_predict(model_params_path, models_to_run, dataset_split):
         l1 = row["L1"]
         l1_datasets = ["es", "de", "cn"] if l1 == "xx" else [l1]
 
+        beta = row.get('annealing_factor')
+        z_dim = row.get('latent_dim')
+        dropout = row.get("dropout")
+        pred_head = row.get('pred_head')
+        layer_wise = row.get('layer_wise')
+        token_wise = row.get('token_wise')
+        pos_encoding = row.get('pos_encoding')
+        learned_pos = row.get('learned_pos')
+        max_seq_len = row.get('max_seq_len')
+        # Only cast if they exist, otherwise leave as None
+        if beta is not None:
+            beta = float(beta)
+        if z_dim is not None:
+            z_dim = int(z_dim)
+        if dropout is not None:
+            dropout = float(dropout)
+        if max_seq_len is not None:
+            max_seq_len = int(max_seq_len)
+
         for l1 in l1_datasets:
             try:
                 logging.info(
@@ -80,13 +102,45 @@ def run_predict(model_params_path, models_to_run, dataset_split):
                     desc="Tokenizing input text",
                 )
 
+                # Itemize L1 
+                l1_to_idx = {l1:i for i, l1 in enumerate(["es", "de", "cn"])}
+                tokenized_ds = tokenized_ds.map(
+                    lambda x: {"l1_encode": [l1_to_idx[val] for val in x['L1']]},
+                    batched=True,
+                    remove_columns=['L1'],
+                    desc="Itemizing L1"
+                )
+
                 # Load the fine-tuned model
                 model_path = MODELS_DIR / model_name
-                model = AutoModelForSequenceClassification.from_pretrained(model_path)
+                # Check for Custom Architectures
+                if "baseline" in model_name:
+                    logging.info(f"Loading Baseline Model from {model_path}")
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        model_path
+                    )
+                else:
+                    logging.info(f"Loading Customized Model from {model_path}")
+                    model = CloseTrack_Predictor.from_pretrained(
+                        model_path, 
+                        dropout=dropout,
+                        latent_dim=z_dim,
+                        beta=beta,
+                        layer_wise=layer_wise,
+                        token_wise=token_wise,
+                        pred_head=pred_head,
+                        pos_encoding=pos_encoding,
+                        learned_pos=learned_pos,
+                        max_seq_len=max_seq_len
+                    )
+                        
                 model.eval()
 
                 # Initialize trainer
-                data_collator = DataCollatorWithPadding(tokenizer)
+                if "cvae" in model_name.lower():
+                    data_collator = CVAEDataCollator(tokenizer, custom_features=["l1_labels", "labels"])
+                else:
+                    data_collator = DataCollatorWithPadding(tokenizer)
                 trainer = Trainer(
                     model=model,
                     data_collator=data_collator,
@@ -95,6 +149,9 @@ def run_predict(model_params_path, models_to_run, dataset_split):
                         report_to="none"
                     ),
                 )
+
+                # Verify model is on the correct device
+                logging.info(f"Model successfully loaded on: {trainer.model.device}")
 
                 # Loop over requested dataset splits (dev / test)
                 for split_name in splits_to_run:
@@ -113,7 +170,10 @@ def run_predict(model_params_path, models_to_run, dataset_split):
                 
                     # Run inference and flatten predictions
                     with torch.no_grad():
-                        preds = trainer.predict(ds).predictions.flatten()
+                        predictions = trainer.predict(ds).predictions
+                        if isinstance(predictions, tuple):
+                            predictions = predictions[0]
+                        preds = predictions.flatten()
                 
                     # Get item IDs to align with predictions
                     item_ids = hf_dataset[hf_key]["item_id"]
