@@ -1,4 +1,6 @@
 # utils.py
+import os
+import json
 import random
 import gc
 import logging
@@ -11,9 +13,10 @@ import pandas as pd
 import torch
 
 from torch.optim import AdamW
-from sklearn.metrics import root_mean_squared_error
+from sklearn.metrics import root_mean_squared_error, accuracy_score
 from scipy.stats import pearsonr
 from transformers import logging as hf_logging
+from wordfreq import zipf_frequency
 
 def configure_logging(verbose=False):
     """
@@ -204,7 +207,7 @@ def preprocess_dataset(ds_dict, cols_to_merge, sep_token):
     Preprocess a Hugging Face DatasetDict by:
         1. Merging specified text columns into a single 'input_text' column.
         2. Renaming the target column 'GLMM_score' to 'label'.
-        3. Removing all other columns except 'input_text', 'l1' and 'label'.
+        3. Removing all other columns except 'input_text' and 'label'.
 
     Args:
         ds_dict (datasets.DatasetDict): Input DatasetDict with one or more splits.
@@ -219,7 +222,7 @@ def preprocess_dataset(ds_dict, cols_to_merge, sep_token):
     # Compute columns to remove
     first_split = next(iter(ds_dict.values())) # get first key in ds_dict
     all_columns = first_split.column_names
-    cols_to_keep = ["input_text", "L1", "label"]
+    cols_to_keep = ["input_text", "labels", "en_target_pos"]
     cols_to_remove = [c for c in all_columns if c not in cols_to_keep and c != 'GLMM_score']
     
     # Format input text, rename target label and remove extra columns
@@ -228,10 +231,9 @@ def preprocess_dataset(ds_dict, cols_to_merge, sep_token):
         batched=True,
         fn_kwargs={"cols_to_merge": cols_to_merge, "sep_token": sep_token},
         desc="Formatting input text"
-    ).rename_column("GLMM_score", "label").remove_columns(cols_to_remove)
+    ).rename_column("GLMM_score", "labels").remove_columns(cols_to_remove)
     
     return ds_dict
-
 
 def compute_metrics(eval_pred):
     """
@@ -242,17 +244,43 @@ def compute_metrics(eval_pred):
 
     Returns:
         dict: Dictionary containing RMSE and Pearson correlation.
-    """
+    """  
     predictions, labels=eval_pred
-    if isinstance(predictions, tuple):
-        predictions = predictions[0]
-    if isinstance(labels, tuple):
-        labels = labels[0]
-    predictions = predictions.flatten() # shape (num_examples,)
-    rmse = root_mean_squared_error(labels, predictions)
-    p_corr, _ = pearsonr(predictions, labels)
     
-    return {"rmse": rmse, "pearson": p_corr}
+    if isinstance(predictions, tuple):
+        reg_preds = predictions[0]
+        pos_logits = predictions[-1]
+    else:
+        # Fallback if only one task is returned
+        reg_preds = predictions
+        pos_logits = None
+   
+    if isinstance(labels, tuple) or (isinstance(labels, np.ndarray) and labels.ndim > 1 and labels.shape[1] > 1):
+        # Depending on how the DataCollator/Trainer bundles labels:
+        reg_labels = labels[0]
+        pos_labels = labels[1]
+    else:
+        reg_labels = labels
+        pos_labels = None
+
+    results = {}
+    
+    reg_preds = reg_preds.flatten()
+    reg_labels = reg_labels.flatten()
+    
+    results["rmse"] = root_mean_squared_error(reg_labels, reg_preds)
+    results["pearson"], _ = pearsonr(reg_preds, reg_labels)
+
+    # --- AUXILIARY TASK: POS Classification ---
+    if pos_logits is not None and pos_labels is not None:
+        # Get the predicted class index (Argmax)
+        pos_preds = np.argmax(pos_logits, axis=-1).flatten()
+        pos_labels = pos_labels.flatten()
+        
+        # Calculate Accuracy
+        results["pos_accuracy"] = accuracy_score(pos_labels, pos_preds)
+    
+    return results
 
 
 def print_evaluation_results(eval_results_df, decimals=3):
@@ -336,33 +364,49 @@ def cleanup_trainer_memory(*objects):
     for obj in objects:
         del obj
 
+def save_best_sweep_results(model_name: str, best_trial, save_dir: str):
+    """
+    Extracts the best hyperparameters from a Hugging Face Trainer sweep 
+    and saves them to a dedicated JSON file to prevent HPC write collisions.
+    
+    Args:
+        model_name (str): The name of the model being run (e.g., 'mbert-base_mlp').
+        best_trial: The BestRun object returned by trainer.hyperparameter_search().
+        save_dir (str): The directory where the JSON files will be stored.
+    """
+    if best_trial is None:
+        print(f"⚠️ Warning: No best trial found for {model_name}. Skipping save.")
+        return
 
-def custom_optimizer(model, base_lr, weight_decay, acc_lr=1e-3):
-    # Separate the parameters into two groups
-    backbone_params = []
-    head_params = []
+    # 1. Ensure the output directory exists
+    os.makedirs(save_dir, exist_ok=True)
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        # If the layer name contains 'backbone', it goes to the slow group
-        if 'ScalarMix' in name or 'mlp' in name:
-            head_params.append(param)
-        # Otherwise (mlp, scalar_mix), it goes to the fast group
-        else:
-            backbone_params.append(param)
+    # 2. Sanitize the model name for the filesystem (replaces slashes with underscores)
+    safe_model_name = model_name.replace("/", "_")
+    filepath = os.path.join(save_dir, f"{safe_model_name}.json")
 
-    # Assign the differential learning rates
-    optimizer_grouped_parameters = [
-        {
-            "params": backbone_params, 
-            "lr": base_lr 
-        },  
-        {
-            "params": head_params, 
-            "lr": acc_lr   
-        }       
-    ]
+    # 3. Extract the data. 
+    # Hugging Face returns a BestRun object with 'objective', 'hyperparameters', and 'run_id'
+    try:
+        objective = getattr(best_trial, 'objective', None)
+        hyperparameters = getattr(best_trial, 'hyperparameters', {})
+        run_id = getattr(best_trial, 'run_id', 'unknown_run')
+    except AttributeError:
+        # Fallback just in case a different backend returns a dictionary
+        objective = best_trial.get('objective')
+        hyperparameters = best_trial.get('hyperparameters', {})
+        run_id = best_trial.get('run_id', 'unknown_run')
 
-    # 4. Initialize the custom optimizer
-    return AdamW(optimizer_grouped_parameters, weight_decay=weight_decay)
+    # 4. Package into a clean dictionary
+    result_data = {
+        "model_name": model_name,
+        "run_id": run_id,
+        "best_metric_score": objective,
+        "hyperparameters": hyperparameters
+    }
+
+    # 5. Write to disk
+    with open(filepath, "w") as f:
+        json.dump(result_data, f, indent=4)
+
+    print(f"✅ Successfully saved best hyperparameters for {model_name} to {filepath}")

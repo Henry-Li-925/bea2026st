@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, AutoModel, AutoConfig
+from transformers import PreTrainedModel, AutoModel, AutoConfig, DataCollatorWithPadding
 from transformers.modeling_outputs import ModelOutput
 
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import copy
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Any, Dict
 
 
 @dataclass
@@ -15,8 +16,36 @@ class CustomClassifierOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     token_attn_weights: Optional[torch.FloatTensor] = None
+    
+@dataclass
+class MultiTaskClassifierOutput(CustomClassifierOutput):
+    """Extends output to include auxiliary POS logits and loss."""
+    pos_logits: torch.FloatTensor = None
 
-class VIBClassificationHead(nn.Module):
+@dataclass
+class MultiTaskDataCollator(DataCollatorWithPadding):
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Extract POS labels if they exist
+        pos_labels = [f.pop("pos_labels") for f in features] if "pos_labels" in features[0] and features[0]["pos_labels"] is not None else None
+        
+        # 2. Safely remove standard 'labels' if they are None to prevent the base class crash
+        for f in features:
+            if "labels" in f and f["labels"] is None:
+                del f["labels"]
+            if "label" in f and f["label"] is None:
+                del f["label"]
+        
+        # Base class handles input_ids, masks, and regression 'labels'
+        batch = super().__call__(features)
+
+        if pos_labels is not None:
+            # Simple tensor conversion (Batch_Size,)
+            batch["pos_labels"] = torch.tensor(pos_labels, dtype=torch.long)
+
+        return batch
+
+# Not Used
+class VIBHead(nn.Module):
     def __init__(self, config, latent_dim=64):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
@@ -53,20 +82,55 @@ class VIBClassificationHead(nn.Module):
         
         return logits, mu, logvar
 
+class MaxPooling(nn.Module):
+    def __init__(
+        self,
+        dim:int=0,
+        cls_only:bool=True,
+        **kwargs
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.cls_only = cls_only
+    
+    def forward(self, x, **kwargs):
+        if self.cls_only:
+            x = [layer[:, 0, :] for layer in x]
+            x = torch.stack(x, self.dim).unsqueeze(-2)
+        else:
+            x = torch.stack(x, self.dim)
+        return torch.max(x, self.dim).values
+
+class MeanPooling(nn.Module):
+    def __init__(
+        self,
+        dim:int=0,
+        cls_only:bool=True
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.cls_only = cls_only
+        
+    def forward(self, x, **kwargs):
+        if self.cls_only:
+            x = [layer[:, 0, :] for layer in x]
+            x = torch.stack(x, self.dim).unsqueeze(-2)
+        else:
+            x = torch.stack(x, self.dim)
+        return torch.mean(x, self.dim)
+
 class ScalarMix(nn.Module):
     def __init__(
         self, 
         mixture_size: int=13, 
         do_layer_norm: bool = True,
         initial_scalar_parameters: List[float] = None,
-        have_temperature: bool = True,
-        trainable: bool = False
+        trainable: bool = True
         ) -> None:
         """
         Layer mixing through global scalar weights. Adapted from [https://github.com/allenai/allennlp/blob/main/allennlp/modules/scalar_mix.py].
         Important implemenation strategy:
             - do_layer_norm: perform layer normalization for numerical stability.
-            - have_temperature: introduce an additional temp parameter that regulates the scalar weights. tau = base_temp + factor * temp
             - trainable: whether the gamma parameter is trainable.
         """
         
@@ -85,14 +149,6 @@ class ScalarMix(nn.Module):
         else:
             self.gamma = nn.Parameter(torch.tensor([1.0]))
 
-
-        self.have_temperature = have_temperature
-        if self.have_temperature:
-            # adding a new learnable parameter: temperature
-            self.base_temp = 1e2
-            self.factor = 1e5
-            self.temp = nn.Parameter(torch.tensor([1e-2]))
-            
         self.scalar_weights = nn.Parameter(
             initial_scalar_parameters
             )
@@ -100,38 +156,22 @@ class ScalarMix(nn.Module):
     def forward(
         self, 
         tensors: List[torch.Tensor],
-        mask: torch.bool=None
+        mask: torch.bool=None,
+        **kwargs
         ) -> torch.Tensor:
         """
         Values:
             tensors = [layer_1, layer_2, ..., layer_n]
             weights = [w_1, ..., w_n]
         Formula:
-            tau = base_temp + factor * temp
-            normed_weights = layer_norm(weights * tau)
+            normed_weights = layer_norm(weights)
             output = gamma * sum(softmax(normed_weights) * tensors)
         Return:
             a batched tensor of the shape (batch_size, seq_len, hidden_size)
         """
-        # gamma * sum(softmax(weight) * tensor, dim=1)
 
-        if self.have_temperature:
-            # tau = base_temp + factor * temp
-            # weight = scalar_weight * tau
-            tau = self.base_temp + self.factor*self.temp
-            normed_weights = self.softmax(self.scalar_weights * tau) # (mixture_size)
-        else:
-            normed_weights = self.softmax(self.scalar_weights) # (mixture_size)
+        normed_weights = self.softmax(self.scalar_weights) # (mixture_size)
         
-        # Elmo-style global layer norm. Adapted from AllenNLP's Scalar Mix.
-        def _Elmo_do_layer_norm(tensors, broadcast_mask, num_elements_not_masked, eps = 1e-13):
-            # (x - mean) / sqrt(variance + eps)
-            masked_pt = broadcast_mask * tensors # (n_layer, batch_size, seq_len, hidden_size)
-            num_elements_not_masked = num_elements_not_masked[None, :, None] # (1, batch_size, 1)
-            mean = torch.sum(masked_pt, dim=-2) / num_elements_not_masked # (n_layer, batch_size, hidden_size)
-            variance = torch.sum(((masked_pt - mean.unsqueeze(-2)) * broadcast_mask) **2, dim=-2) / num_elements_not_masked # (n_layer, batch_size, hidden_size)
-            return (masked_pt - mean.unsqueeze(-2)) / torch.sqrt(variance.unsqueeze(-2) + eps) # (n_layer, batch_size, seq_len, hidden_size)
-
         mixed_tensor = None
         if self.do_layer_norm:
             assert mask is not None
@@ -139,12 +179,11 @@ class ScalarMix(nn.Module):
             
             # Token-wise layer norm
             tensors = torch.stack(tensors, 0) # (n_layer, batch_size, seq_len, hidden_size)
-            input_dim = tensors.size(-1) # hidden_size for each sequence.
-
+            
             # PyTorch's provides off-the-shelf layer_norm function that is readily vectorized.  
-            normed_tensors = F.layer_norm(tensors, normalized_shape=(input_dim, )) # tokenwise normalization: normalize across the last dimension only.
+            normed_tensors = F.layer_norm(tensors, normalized_shape=(tensors.size(-1), )) # tokenwise normalization: normalize across the last dimension only.
             # seq_len = tensors.size(-2) 
-            # normed_tensors = F.layer_norm(tensors, normalized_shape=(seq_len, input_dim)) # sequencewise normalization: normalize across the last two dimensions
+            # normed_tensors = F.layer_norm(tensors, normalized_shape=(tensors.size(-2), tensors.size(-1))) # sequencewise normalization: normalize across the last two dimensions
             normed_tensors = normed_tensors * broadcast_mask # masking normed tensors
             
             weights_shape = (-1,) + (1,) * (tensors.dim() - 1) # (-1, 1, 1, 1)
@@ -152,106 +191,39 @@ class ScalarMix(nn.Module):
             mixed_tensor = torch.sum(normed_weights * normed_tensors, dim=0) # (1, batch_size, seq_len, hidden_size)
 
         else:
-            # vectorized for efficiency
-            tensors = torch.stack(tensors, 0) # (layer, batch_size, seq_len, hidden_dim)
-            weights_shape = (-1,) + (1,) * (tensors.dim() - 1) # (-1, 1, 1, 1)
+            # if no layer norm, by default we extract only the first token
+            tensors = [layer[:, 0, :] for layer in tensors] # extract the first token (batch_size, seq_len, hidden_size) -> (batch_size, hidden_dim)
+            tensors = torch.stack(tensors, 0) # (layer, batch_size, hidden_dim)
+            tensors = F.layer_norm(tensors, normalized_shape=(tensors.size(-1),)) # normalize within token to prevent gradient explode.
+            weights_shape = (-1,) + (1,) * (tensors.dim() - 1) # (-1, 1, 1)
             normed_weights = normed_weights.view(weights_shape) # broadcastable to tensors
-            mixed_tensor = torch.sum(normed_weights * tensors, dim=0) # (batch_size, seq_len, hidden_size)
+            mixed_tensor = torch.sum(normed_weights * tensors, dim=0).unsqueeze(1) # (batch_size, 1, hidden_size)
         
         return self.gamma * mixed_tensor
 
-class PositionalEncoding(nn.Module): 
-    """Positional encoding."""
-    def __init__(self, num_hiddens, dropout, max_len=1000):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        # Create a long enough P
-        self.P = torch.zeros((1, max_len, num_hiddens))
-        X = torch.arange(max_len, dtype=torch.float32).reshape(
-            -1, 1) / torch.pow(10000, torch.arange(
-            0, num_hiddens, 2, dtype=torch.float32) / num_hiddens)
-        self.P[:, :, 0::2] = torch.sin(X)
-        self.P[:, :, 1::2] = torch.cos(X)
-
-    def forward(self, X):
-        X = X + self.P[:, :X.shape[1], :].to(X.device)
-        return self.dropout(X)
-        
-class LearnedPositionalEncoding(nn.Module):
-    def __init__(self, max_seq_len=128, latent_dim=768):
-        super().__init__()
-        self.positional_embedding = nn.Embedding(max_seq_len, latent_dim)
-    
-    def forward(self, x):
-        positions = torch.arange(x.size(-2)).expand(x.size(0), -1).to(x.device)
-        embed = self.positional_embedding(positions)
-        return x + embed
-
-class AdditiveAttention(nn.Module):
-    def __init__(self, hidden_size, dropout):
-        super().__init__()
-        # Projects hidden states to compute attention scores
-        self.W = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v = nn.Linear(hidden_size, 1, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, hidden_states, attention_mask):
-        """
-        hidden_states: [batch_size, seq_len, hidden_size]
-        attention_mask: [batch_size, seq_len]
-        """
-        # 1. Compute unnormalized attention scores
-        # Shape: [batch_size, seq_len, 1] -> [batch_size, seq_len]
-        scores = self.v(torch.tanh(self.W(hidden_states))).squeeze(-1)
-        
-        # 2. Mask out padding tokens so they don't receive attention
-        # We use a large negative number (-1e9) so softmax outputs 0
-        scores = scores.masked_fill(attention_mask == 0, -1e9)
-        
-        # 3. Normalize scores into probabilities (alpha weights)
-        attn_weights = torch.softmax(scores, dim=-1) # [batch_size, seq_len]
-        
-        # 4. Compute the weighted sum of hidden states (Context Vector)
-        # unsqueeze attn_weights to [batch, 1, seq_len] for batch matrix multiplication
-        # output shape: [batch, 1, hidden_size] -> [batch, 1, hidden_size]
-        context_vector = torch.bmm(self.dropout(attn_weights).unsqueeze(1), hidden_states)
-        
-        return context_vector, attn_weights
-
-class Backbone(PreTrainedModel):
+class CustomModel(PreTrainedModel):
+    # 1. Tell Hugging Face which configuration class to use
     config_class = AutoConfig
-    def __init__(
-        self,
-        config
-    ):
-        """
-        Instantiate the model backbone as a subclass of PreTrainedModel.
-        Due to transformer's design pattern, we have to assign model prefix for backbones of different structures. 
-        e.g. roberta: ["xlm-roberta", "roberta"]
-        """
-        super().__init__(config)
-        self.config = config
-        model_type = config.model_type
-        if model_type in ['xlm-roberta', 'roberta']:
-            # add_pooling_layer=False to get raw hidden states
-            self.roberta = AutoModel.from_config(config, add_pooling_layer=False)
-            self.__class__.base_model_prefix = "roberta"
     
-    def forward(self):
-        raise NotImplementedError("ERROR: forward not implemented!")
-
-class CloseTrack_Predictor(Backbone):
-    def __init__(
-        self,
-        config,
-        dropout: float = 0.1,
-        latent_dim: int = 64,
-        beta: float = 1e-3, 
-        layer_wise: Optional[str] = None,
-        token_wise: Optional[str] = None,
-        pred_head: str = 'mlp',
-        **kwargs
-    ):
+    @property
+    def all_tied_weights_keys(self):
+        """
+        Overrides the internal HF tied weights tracker.
+        This model is a regression/classification architecture, 
+        so it does not use tied weights (unlike language models).
+        """
+        return {}
+    
+    @property
+    def backbone(self):
+        if hasattr(self, 'roberta'):
+            return self.roberta
+        elif hasattr(self, 'model'):
+            return self.model
+        raise AttributeError("Backbone not initialized properly.")
+    
+    
+    def __init__(self,config,**kwargs):
         """
         Our customized predictor that performs layer fusion and/or token fusion strategies to exploit transformer's internal structure. Currently, we have implemented 
         one method for layer fusion (layer_wise) and two for token fusion (token_wise). If both are not provided, the predictor reduces to the ordinary regressor, 
@@ -259,89 +231,118 @@ class CloseTrack_Predictor(Backbone):
             - layer_wise:
                 - "ScalarMix": the layer fusion method that learns a global set of weights for each internal layers before pooling into a single hidden state. 
             - token_wise: 
-                - 'AddAttn': the Additive Attention (see [https://d2l.ai/chapter_attention-mechanisms-and-transformers/attention-scoring-functions.html#additive-attention])
                 - 'SelfAttn': the Multi-head self-attention, implemented by the PyTorch off-the-self nn.MultiheadAttention function.
-                    Since the Positional Encoding are used in transformer training, two types of positional encoder are used for self-attention for investigation
-                    - Sinusodial: [https://d2l.ai/chapter_attention-mechanisms-and-transformers/self-attention-and-positional-encoding.html#positional-encoding]
-                    - Learned: [https://machinelearningmastery.com/positional-encodings-in-transformer-models/]
             - pred_head: the regressor used for prediction
                 - 'mlp': the same MLP regressor as used in XLMRobertaForSequenceClassification
                 - 'vib': a testing regressor that follows the idea of Variational Information Bottleneck, which is essentially a regularized regressor.
         """
         super().__init__(config)
+        
+        # --- CONFIGURATION BINDING ---
+        # We save any custom arguments into the config. 
+        # This guarantees they are permanently written to `config.json` when you save the model!
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+            
+        self.pred_head = getattr(config, 'pred_head', 'mlp')
+        self.token_pool = getattr(config, 'token_pool', 'cls')
+        self.dropout = getattr(config, 'dropout', 0.1)
+        
+        model_type = config.model_type
+        
+        # --- BUILD THE SKELETON (NO WEIGHTS LOADED HERE) ---
+        if model_type in ['xlm-roberta', 'roberta']:
+            self.base_model_prefix = "roberta"
+            self.roberta = AutoModel.from_config(config, 
+                                                 add_pooling_layer=False    # Disable XLMRobertaPool which
+                                                                            # use cls pooling by default
+                                                                            # it is also the default option
+                                                                            # when calling XLMRobertaForSequenceClassification
+                                                 )
+        elif model_type in ['modernbert']:
+            self.base_model_prefix = "model"
+            self.model = AutoModel.from_config(config)
+        else:
+            raise NotImplementedError(f"Backbone '{model_type}' is not supported by this predictor.")
 
-        # initiate layer fusion strategy
-        self.layer_wise = layer_wise
-
-        if self.layer_wise == 'ScalarMix':  
-            self.ScalarMix = ScalarMix(
-                config.num_hidden_layers + 1
+         # --- BUILD THE REGRESSION HEAD ---
+        hidden_size = config.hidden_size
+        
+        if self.pred_head == 'mlp':
+            if model_type in ['xlm-roberta', 'roberta']:
+                # class XLMRobertaClassificationHead(nn.Module):
+                # https://github.com/huggingface/transformers/blob/aad13b87ed59f2afcfaebc985f403301887a35fc/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L918
+                self.regressor = nn.Sequential(
+                    nn.Dropout(self.dropout),
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.Tanh(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(hidden_size, 1)
+                )
+            elif model_type in ['modernbert']:
+                # Following the setup of ModernBERT classifier
+                # https://github.com/huggingface/transformers/blob/aad13b87ed59f2afcfaebc985f403301887a35fc/src/transformers/models/modernbert/modeling_modernbert.py#L493
+                # https://github.com/huggingface/transformers/blob/aad13b87ed59f2afcfaebc985f403301887a35fc/src/transformers/models/modernbert/modeling_modernbert.py#L581
+                self.regressor = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size, bias=config.classifier_bias),
+                    nn.GELU(),
+                    nn.LayerNorm(hidden_size, eps=config.norm_eps, bias=config.norm_bias),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(hidden_size, 1)
+                    )          
+        else: # default regressor
+            self.regressor = nn.Sequential(
+                nn.Dropout(self.dropout),
+                nn.Linear(hidden_size, 1)
+            )
+        
+        self.layer_pool = getattr(config, 'layer_pool', None)
+        self.last_k_layer = getattr(config, 'last_k_layer', None)
+        if self.layer_pool:
+            if self.layer_pool == 'scalarmix':
+                self.layer_pooler = ScalarMix(
+                    self.last_k_layer if self.last_k_layer is not None else config.num_hidden_layers + 1,
+                    do_layer_norm= self.layer_pool != 'cls',
+                    trainable=True
+                )
+            elif self.layer_pool == 'max':
+                self.layer_pooler = MaxPooling(
+                    dim = 0,
+                    cls_only = self.layer_pool == 'cls'
+                )
+            elif self.layer_pool == 'mean':
+                self.layer_pooler = MeanPooling(
+                    dim = 0,
+                    cls_only = self.layer_pool == 'cls'
                 )
 
         # initiate token fusion strategy
-        self.token_wise = token_wise
-
-        if self.token_wise == "AddAttn":
-            self.attention  = AdditiveAttention(
-                hidden_size = config.hidden_size,
-                dropout = dropout
-                )
-
-        elif self.token_wise == "SelfAttn":
-            self.attention = nn.modules.activation.MultiheadAttention(
-                embed_dim = config.hidden_size,
-                num_heads = 1,
-                dropout = dropout,
-                batch_first = True
-                )
-        
-        # inititate Positional Encoder
-        self.pos_encoding = kwargs.get('pos_encoding', False)
-        self.learned_pos = kwargs.get('learned_pos', False)
-        self.max_seq_len = kwargs.get('max_seq_len', 128)
-
-        if self.pos_encoding:
-            if self.learned_pos:
-                self.pos_encoder = LearnedPositionalEncoding(
-                    max_seq_len=self.max_seq_len, 
-                    latent_dim=config.hidden_size
-                    )
-            else:
-                self.pos_encoder = PositionalEncoding(
-                    num_hiddens=config.hidden_size, 
-                    dropout=dropout, 
-                    max_len=self.max_seq_len
-                    )
-
-        # initiate regressor
-        self.beta = beta
-        self.pred_head = pred_head
-        if self.pred_head == 'mlp':
-            self.regressor = nn.Sequential(
-                nn.Linear(config.hidden_size, config.hidden_size),
-                nn.Dropout(dropout),
-                nn.Linear(config.hidden_size, config.num_labels)
+        self.token_pool = getattr(config, 'token_pool', 'cls')
+        if self.token_pool == 'mha':
+            if getattr(config, 'num_heads', None) is None:
+                raise ValueError(f'The number of multiple heads is not defined!')
+            if config.hidden_size % config.num_heads != 0:
+                raise ValueError(f"The hidden size ({config.hidden_size}) must be a multiple of num_heads ({config.num_heads}).")
+            self.token_pooler = nn.MultiheadAttention(
+                embed_dim=hidden_size,
+                num_heads=config.num_heads,
+                dropout=self.dropout,
+                batch_first=True
             )
-        elif self.pred_head == 'vib':
-            self.regressor = VIBClassificationHead(
-                config, 
-                latent_dim=latent_dim
-                )
-
-        # Initialize weights (Hugging Face standard)
-        self.post_init()
+        else:
+            self.token_pooler = None
 
     def forward(
         self,
         input_ids,
         attention_mask,
-        labels,
+        labels=None,
         **kwargs
-        ) -> CustomClassifierOutput:
+    ) -> CustomClassifierOutput:
         """
         Argument:
             input_ids: the tokenized input 
-            attnention_mask: the sequence mask output by the tokenizer
+            attention_mask: the sequence mask output by the tokenizer
             labels: the target labels
         Return:
             CustomClassifierOutput(
@@ -353,71 +354,52 @@ class CloseTrack_Predictor(Backbone):
             )
         """
 
-        # The Trainer passes 'num_items_in_batch' which the backbone doesn't accept.
-        if "num_items_in_batch" not in self.config:
-            kwargs.pop("num_items_in_batch", None)
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            **kwargs
+        )
 
-        # identify the backbone and generate the hidden states. 
-        if hasattr(self, "roberta"):
-            outputs = self.roberta(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                **kwargs
-            )
+        if self.layer_pool:
+            hiddens = list(outputs.hidden_states)[-self.last_k_layer:] if self.last_k_layer is not None else list(outputs.hidden_states)
+            output_hiddens = self.layer_pooler(hiddens, mask=attention_mask)
+        else:
+            output_hiddens = outputs.last_hidden_state
 
         attn_weights = None
-
-        # if layer fusion is applied
-        if self.layer_wise:
-            # mixes the entire sequences from all layers, not just the first token to support following token-wise aggregation
-            hiddens = list(outputs.hidden_states) # [layer, batch, seq, hidden]
-
-            if self.layer_wise == "ScalarMix":
-                hiddens = self.ScalarMix(hiddens, mask = attention_mask) # [1, batch, seq, hidden]
-            else:
-                # reduce to the last hidden states rn, wait for other layer fusion methods 
-                hiddens = hiddens[-1] # [batch, seq, hidden]
-        else:
-            # else, uses only the last hidden states.
-            hiddens = outputs.last_hidden_state # [batch, seq, hidden]
-
-        # if token fusion is applied
-        if self.token_wise:
-            if self.token_wise == "AddAttn":
-                hiddens, attn_weights = self.attention(hiddens, attention_mask) # hiddens: [batch, 1, hidden_size] attn_weights: [batch, seq]
-            elif self.token_wise == "SelfAttn":
-                padding_masks = ~attention_mask.to(torch.bool) # key_padding_mask argument in MultiheadAttention uses boolean mask where True indicates padding.
-                # if positional encoding is applied
-                if self.pos_encoding:
-                    hiddens = self.pos_encoder(hiddens)
-                
-                hiddens, attn_weights = self.attention(hiddens, hiddens, hiddens, key_padding_mask  = padding_masks) # hiddens: [batch, seq, hidden_size] attn_weights: [batch, seq, seq]
-
-                # extract only </s> token's attention weights
-                attn_weights = attn_weights[:,0,:] # [batch_size, seq_len, seq_len] -> [batch_size, seq_len]
-
-        # predict with the first token   
-        hiddens = hiddens[:, 0, :] # [batch, 1, hidden]
         
-        if self.pred_head == 'mlp':
-            logits = self.regressor(hiddens) 
-            loss = None           
-            if labels is not None:
-                loss_fct = nn.MSELoss(reduction='mean')
-                loss = loss_fct(logits.squeeze(), labels.squeeze())
-
-        elif self.pred_head == 'vib':
-            logits, mu, logvar = self.regressor(hiddens)
-            loss = None
-            if labels is not None:     
-                loss_fct = nn.MSELoss(reduction='sum')
-                pred_loss = loss_fct(logits.squeeze(), labels.squeeze()) / input_ids.size(0)
-
-                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-                kl_loss = kl_loss / input_ids.size(0)
-
-                loss = pred_loss + (self.beta * kl_loss)
+        if self.token_pool == 'mean':
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    output_hiddens.shape[:2], device=output_hiddens.device, dtype=torch.bool
+                )
+            mask_float = attention_mask.to(output_hiddens.dtype)
+            pooled_output = (output_hiddens * mask_float.unsqueeze(-1)).sum(dim=1) / torch.clamp(mask_float.sum(
+                dim=1, keepdim=True
+            ), min=1e-9) # prevent division by zero
+        elif self.token_pool == 'mha':
+            last_cls_hidden = output_hiddens[:, 0, :].unsqueeze(1)
+            padding_masks = ~attention_mask.to(torch.bool)
+            attn_output, ave_attn_weights = self.token_pooler(
+                query=last_cls_hidden,
+                key=output_hiddens,
+                value=output_hiddens,
+                key_padding_mask=padding_masks,
+                need_weights=True,
+                average_attn_weights=True
+            )
+            pooled_output = attn_output[:, 0, :]
+            attn_weights = ave_attn_weights[:,0,:]
+        else:
+            pooled_output = output_hiddens[:, 0, :]
+            
+            
+        loss = None
+        logits = self.regressor(pooled_output)
+        if labels is not None:
+            loss_fct = nn.MSELoss()
+            loss = loss_fct(logits.view(-1), labels.view(-1))      
         
         return CustomClassifierOutput(
             loss=loss,
@@ -427,179 +409,326 @@ class CloseTrack_Predictor(Backbone):
             token_attn_weights=attn_weights
         )
 
-class Ensemble_MLP(PreTrainedModel):
-    config_class = AutoConfig
-    def __init__(
-        self, 
-        config, 
-        dropout: float = 0.1,
-        full_sequence: bool = False,
-        l1_aug: bool = True
-        ):
-
-        super().__init__(config)
-        
-        self.config = config
-        self.full_sequence = full_sequence
-
-        model_type = config.model_type
-
-        if model_type in ['xlm-roberta', 'roberta']:
-            # add_pooling_layer=False to get raw hidden states
-            self.roberta = AutoModel.from_config(config, add_pooling_layer=False)
-            self.__class__.base_model_prefix = "roberta"
-        
-        # full_sequence = False, use only <CLS> or <s> token for classification
-        # no need for layer norm if not full_sequence
-        do_layer_norm = full_sequence
-
-        self.ScalarMix = ScalarMix(
-            config.num_hidden_layers + 1,
-            do_layer_norm = do_layer_norm
-            )
-
-        self.mlp = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Dropout(dropout),
-            nn.Linear(config.hidden_size, config.num_labels)
-        )
-
-            
-        # Initialize weights (Hugging Face standard)
-        self.post_init()
-
     def forward(
         self,
         input_ids,
         attention_mask,
-        labels,
-        l1_embed = None,
-        **kwargs) -> CustomClassifierOutput:
-        # The Trainer passes 'num_items_in_batch' which the backbone doesn't accept.
-        if "num_items_in_batch" not in self.config:
-            kwargs.pop("num_items_in_batch", None)
+        labels=None,
+        **kwargs
+    ) -> CustomClassifierOutput:
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            **kwargs
+        )
 
-        if hasattr(self, "roberta"):
-            outputs = self.roberta(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                **kwargs
-            )
-
-        if not self.full_sequence:
-            token = [layer[:, 0, :] for layer in outputs.hidden_states]
-            mixed_token = self.ScalarMix(token) # (batch, hidden)
+        if self.layer_pool:
+            hiddens = list(outputs.hidden_states)[-self.last_k_layer:] if self.last_k_layer is not None else list(outputs.hidden_states)
+            output_hiddens = self.layer_pooler(hiddens, mask=attention_mask)
         else:
-            seq_tokens = [layer for layer in outputs.hidden_states]
-            mixed_seq = self.ScalarMix(seq_tokens, mask = attention_mask) # (batch, seq_len, hidden)
-            
-            # perform mean pooling if using full sequence 
-            boardcast_mask = attention_mask.unsqueeze(-1).float() # (batch, seq_len, 1); float type for numerical stability
-            sum_embed = torch.sum(mixed_seq * boardcast_mask, dim=1)
-            sum_mask = torch.sum(boardcast_mask, dim=1).clamp(min=1e-9) # clamp to avoid zero-division due to all padding
-            mixed_token = sum_embed/sum_mask # --> (batch, hidden)
+            output_hiddens = outputs.last_hidden_state
 
-
-        logits = self.mlp(mixed_token)   
-
+        pooled_output, attn_weights = self._perform_token_pooling(output_hiddens, 
+                                                                  attention_mask, 
+                                                                  self.token_pool, 
+                                                                  self.token_pooler
+                                                                  )
+        
         loss = None
-        if labels is not None:     
-            loss_fct = nn.MSELoss(reduction='mean')
-            loss = loss_fct(logits.squeeze(), labels.squeeze())
+        if self.pred_head == 'vib':        
+            logits, mu, logvar = self.regressor(pooled_output)
             
+            if labels is not None:
+                loss_fct = nn.MSELoss(reduction='sum')
+                pred_loss = loss_fct(logits.view(-1), labels.view(-1)) / pooled_output.size(0)
+
+                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                kl_loss = kl_loss / pooled_output.size(0)
+
+                loss = pred_loss + (self.beta * kl_loss)
+                
+        else:
+            logits = self.regressor(pooled_output)
+            
+            if labels is not None:
+                loss_fct = nn.MSELoss()
+                loss = loss_fct(logits.view(-1), labels.view(-1))      
+                
         return CustomClassifierOutput(
             loss=loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            token_attn_weights=None
+            token_attn_weights=attn_weights
         )
+    
+    @staticmethod
+    def _perform_token_pooling(hiddens, mask, pool_type, pooler_module):
+        """Helper to ensure logic parity between paths."""
+        # Default CLS
+        hiddens_out = hiddens[:, 0, :]
+        attn_weights = None
+        if pool_type == 'mean':
+            m_float = mask.to(hiddens.dtype)
+            hiddens_out = (hiddens * m_float.unsqueeze(-1)).sum(dim=1) / torch.clamp(m_float.sum(dim=1, keepdim=True), min=1e-4)
 
-class Ensemble_MLP_vib(PreTrainedModel):
-    config_class = AutoConfig
-    def __init__(
-        self, 
-        config, 
-        latent_dim = 64, 
-        beta: float = 1e-3, 
-        full_sequence: bool = False
-        ):
-
-        super().__init__(config)
+        elif pool_type == 'mha' and pooler_module:
+            cls_h = hiddens[:, 0, :].unsqueeze(1)
+            p_mask = ~mask.to(torch.bool)
+            attn_out, ave_attn_weights = pooler_module(
+                query=cls_h, 
+                key=hiddens, 
+                value=hiddens, 
+                key_padding_mask=p_mask, 
+                need_weights=True,
+                average_attn_weights=True
+                )
+            hiddens_out = attn_out[:, 0, :]
+            attn_weights = ave_attn_weights[:,0,:]
+            
+        return hiddens_out, attn_weights
         
-        self.config = config
-        self.full_sequence = full_sequence
-
-        model_type = config.model_type
-
-        if model_type in ['xlm-roberta', 'roberta']:
-            # add_pooling_layer=False to get raw hidden states
-            self.roberta = AutoModel.from_config(config, add_pooling_layer=False)
-            self.__class__.base_model_prefix = "roberta"
         
-        # full_sequence = False, use only <CLS> or <s> token for classification
-        # no need for layer norm if not full_sequence
-        do_layer_norm = full_sequence
-
-        self.ScalarMix = ScalarMix(
-            config.num_hidden_layers + 1,
-            do_layer_norm = do_layer_norm
-            )
-
-        self.vib = VIBClassificationHead(config, latent_dim=latent_dim)
-        self.beta = beta
-
-        # Initialize weights (Hugging Face standard)
-        self.post_init()
+class MultiTaskCustomModel(CustomModel):
+    def __init__(self, config, **kwargs):
+        super().__init__(config, **kwargs)
+        
+        # --- AUXILIARY POS HEAD ---
+        self.num_pos_labels = getattr(config, 'num_pos_labels', 7) 
+        
+        # Classification head for the single POS label
+        self.pos_classifier = copy.deepcopy(self.regressor)
+        
+        # same but separate layer_pooler and token_pooler:
+        if hasattr(self, 'token_pooler') and self.token_pooler is not None:
+            self.pos_token_pooler = copy.deepcopy(self.token_pooler)
+        else:
+            self.pos_token_pooler = None
+            
+        if hasattr(self, 'layer_pooler') and self.layer_pooler is not None:
+            self.pos_layer_pooler = copy.deepcopy(self.layer_pooler)
+        else:
+            self.pos_layer_pooler = None
+        
+        if isinstance(self.pos_classifier, nn.Sequential):
+            last_layer_idx = len(self.pos_classifier) - 1
+            in_features = self.pos_classifier[last_layer_idx].in_features
+            self.pos_classifier[last_layer_idx] = nn.Linear(in_features, self.num_pos_labels)
+        else:
+            # Fallback if regressor is a single Linear layer
+            in_features = self.pos_classifier.in_features
+            self.pos_classifier = nn.Linear(in_features, self.num_pos_labels)
+            
+        self.log_vars = nn.Parameter(torch.zeros(2))
 
     def forward(
         self,
         input_ids,
         attention_mask,
-        labels,
-        **kwargs) -> CustomClassifierOutput:
-        # The Trainer passes 'num_items_in_batch' which the backbone doesn't accept.
-        if "num_items_in_batch" not in self.config:
-            kwargs.pop("num_items_in_batch", None)
-
-        if hasattr(self, "roberta"):
-            outputs = self.roberta(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                **kwargs
-            )
-
-        if not self.full_sequence:
-            token = [layer[:, 0, :] for layer in outputs.hidden_states]
-            mixed_token = self.ScalarMix(token) # (batch, hidden)
-        else:
-            seq_tokens = [layer for layer in outputs.hidden_states]
-            mixed_seq = self.ScalarMix(seq_tokens, mask = attention_mask) # (batch, seq_len, hidden)
-            
-            # perform mean pooling if using full sequence 
-            boardcast_mask = attention_mask.unsqueeze(-1).float() # (batch, seq_len, 1); float type for numerical stability
-            sum_embed = torch.sum(mixed_seq * boardcast_mask, dim=1)
-            sum_mask = torch.sum(boardcast_mask, dim=1).clamp(min=1e-9) # clamp to avoid zero-division due to all padding
-            mixed_token = sum_embed/sum_mask # --> (batch, hidden)
-
-        logits, mu, logvar = self.vib(mixed_token)
+        labels=None,      # Primary Task (Difficulty - Float)
+        pos_labels=None,  # Auxiliary Task (POS - Long/Int)
+        **kwargs
+    ) -> MultiTaskClassifierOutput:
         
-        loss = None
-        if labels is not None:     
-            loss_fct = nn.MSELoss(reduction='sum')
-            pred_loss = loss_fct(logits.squeeze(), labels.squeeze()) / mixed_token.size(0)
+        # Use your established backbone + pooling logic
+        # This gives us the pooled_output used for regression
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            **kwargs
+        )
+        
+        # --- PATH A: PRIMARY REGRESSION (Difficulty) ---
+        # 1. Layer Pooling
+        if self.layer_pool:
+            h_reg = list(outputs.hidden_states)[-self.last_k_layer:] if self.last_k_layer else list(outputs.hidden_states)
+            out_h_reg = self.layer_pooler(h_reg, mask=attention_mask)
+        else:
+            out_h_reg = outputs.last_hidden_state
 
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            kl_loss = kl_loss / mixed_token.size(0)
+        # 2. Token Pooling
+        p_out_reg, primary_token_attn_weights = self._perform_token_pooling(out_h_reg, attention_mask, self.token_pool, self.token_pooler)
+        logits = self.regressor(p_out_reg)
 
-            loss = pred_loss + (self.beta * kl_loss)
+        # --- PATH B: AUXILIARY CLASSIFICATION (POS) ---
+        # 1. Layer Pooling (Independent Weights)
+        if self.pos_layer_pooler:
+            h_pos = list(outputs.hidden_states)[-self.last_k_layer:] if self.last_k_layer else list(outputs.hidden_states)
+            out_h_pos = self.pos_layer_pooler(h_pos, mask=attention_mask)
+        else:
+            out_h_pos = outputs.last_hidden_state
+
+        # 2. Token Pooling (Independent Weights)
+        p_out_pos, _ = self._perform_token_pooling(out_h_pos, attention_mask, self.token_pool, self.pos_token_pooler)
+        pos_logits = self.pos_classifier(p_out_pos)
             
-        return CustomClassifierOutput(
-            loss=loss,
+        primary_loss = None
+        pos_loss = None
+
+        # 1. Primary Regression Loss
+        if labels is not None:
+            loss_fct_reg = nn.MSELoss(reduction='mean')
+            primary_loss = loss_fct_reg(logits.view(-1), labels.view(-1))
+
+        # 2. Auxiliary Classification Loss (Single Label per sequence)
+        if pos_labels is not None:
+            loss_fct_pos = nn.CrossEntropyLoss(reduction='mean')
+            pos_loss = loss_fct_pos(pos_logits.view(-1, self.num_pos_labels), pos_labels.view(-1))
+            
+        total_loss = None
+        if primary_loss is not None and pos_loss is not None:
+            safe_log_var0 = torch.clamp(self.log_vars[0], min=-10.0, max=10.0)
+            safe_log_var1 = torch.clamp(self.log_vars[1], min=-10.0, max=10.0)
+            loss1 = torch.exp(-safe_log_var0) * primary_loss + safe_log_var0
+            loss2 = torch.exp(-safe_log_var1) * pos_loss + safe_log_var1
+            total_loss = loss1 + loss2
+            
+        return MultiTaskClassifierOutput(
+            loss=total_loss,
             logits=logits,
+            pos_logits=pos_logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            token_attn_weights=None
+            token_attn_weights=primary_token_attn_weights
+        )
+
+class MultiTaskCascadeCustomModel(CustomModel):
+    def __init__(self, config, **kwargs):
+        # 1. Initialize the Base Model (Builds the backbone and standard regressor)
+        super().__init__(config, **kwargs)
+        
+        self.num_pos_labels = getattr(config, 'num_pos_labels', 20) # Ensure this matches your dataset!
+        hidden_size = config.hidden_size
+        
+        # ==========================================
+        # 2. BUILD THE INDEPENDENT POS PATH
+        # ==========================================
+        self.pos_classifier = copy.deepcopy(self.regressor)
+        
+        # Deepcopy poolers so they have independent weights
+        self.pos_token_pooler = copy.deepcopy(self.token_pooler) if hasattr(self, 'token_pooler') and self.token_pooler else None
+        self.pos_layer_pooler = copy.deepcopy(self.layer_pooler) if hasattr(self, 'layer_pooler') and self.layer_pooler else None
+
+        # Fix the POS classifier's output dimension (from 1 to num_pos_labels)
+        if isinstance(self.pos_classifier, nn.Sequential):
+            last_idx = len(self.pos_classifier) - 1
+            in_features = self.pos_classifier[last_idx].in_features
+            self.pos_classifier[last_idx] = nn.Linear(in_features, self.num_pos_labels)
+        elif hasattr(self.pos_classifier, 'dense'): # Catch VIB Head
+            in_features = self.pos_classifier.decoder.in_features
+            self.pos_classifier.decoder = nn.Linear(in_features, self.num_pos_labels)
+        else:
+            in_features = self.pos_classifier.in_features
+            self.pos_classifier = nn.Linear(in_features, self.num_pos_labels)
+
+        # ==========================================
+        # 3. WIDEN THE PRIMARY REGRESSOR (FEATURE INJECTION)
+        # ==========================================
+        combined_dim = hidden_size + self.num_pos_labels
+        
+        if isinstance(self.regressor, nn.Sequential):
+            # Find the very first Linear layer and widen its input dimension
+            for i, module in enumerate(self.regressor):
+                if isinstance(module, nn.Linear):
+                    out_features = module.out_features
+                    self.regressor[i] = nn.Linear(combined_dim, out_features, bias=module.bias is not None)
+                    break
+        elif hasattr(self.regressor, 'dense'): # Catch VIB Head
+            self.regressor.dense = nn.Linear(combined_dim, hidden_size)
+        else:
+            out_features = self.regressor.out_features
+            self.regressor = nn.Linear(combined_dim, out_features)
+
+        # 4. Learned Log-Variances for Dynamic Precision Weighting
+        self.log_vars = nn.Parameter(torch.zeros(2))
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        labels=None,      # Primary Task (Difficulty)
+        pos_labels=None,  # Auxiliary Task (POS)
+        **kwargs
+    ) -> MultiTaskClassifierOutput:
+        
+        # --- THE SHARED BACKBONE (Runs Only Once for Speed/Memory) ---
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            **kwargs
+        )
+
+        # --- PATH A: AUXILIARY CLASSIFICATION (Runs First) ---
+        if self.pos_layer_pooler:
+            h_pos = list(outputs.hidden_states)[-self.last_k_layer:] if self.last_k_layer else list(outputs.hidden_states)
+            out_h_pos = self.pos_layer_pooler(h_pos, mask=attention_mask)
+        else:
+            out_h_pos = outputs.last_hidden_state
+
+        p_out_pos, _ = self._perform_token_pooling(out_h_pos, attention_mask, self.token_pool, self.pos_token_pooler)
+        
+        # Handle VIB vs Standard
+        if self.pred_head == 'vib':
+            pos_logits, _, _ = self.pos_classifier(p_out_pos)
+        else:
+            pos_logits = self.pos_classifier(p_out_pos)
+
+
+        # --- PATH B: PRIMARY REGRESSION (The Cascade) ---
+        if self.layer_pool:
+            h_reg = list(outputs.hidden_states)[-self.last_k_layer:] if self.last_k_layer else list(outputs.hidden_states)
+            out_h_reg = self.layer_pooler(h_reg, mask=attention_mask)
+        else:
+            out_h_reg = outputs.last_hidden_state
+
+        p_out_reg, primary_token_attn_weights = self._perform_token_pooling(out_h_reg, attention_mask, self.token_pool, self.token_pooler)
+        
+        # 🟢 FEATURE INJECTION MAGIC 
+        # Combine the semantic backbone features with the explicit POS knowledge.
+        # .detach() ensures the primary loss doesn't ruin the POS classifier's weights.
+        combined_features = torch.cat([p_out_reg, pos_logits.detach()], dim=-1)
+
+        if self.pred_head == 'vib':
+            logits, mu, logvar = self.regressor(combined_features)
+        else:
+            logits = self.regressor(combined_features)
+            
+        # --- LOSS CALCULATION ---
+        primary_loss = None
+        if labels is not None:
+            if self.pred_head == 'vib':
+                pred_loss = nn.MSELoss(reduction='sum')(logits.view(-1), labels.view(-1)) / p_out_reg.size(0)
+                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / p_out_reg.size(0)
+                primary_loss = pred_loss + (self.beta * kl_loss)
+            else:
+                primary_loss = nn.MSELoss(reduction='mean')(logits.view(-1), labels.view(-1))
+
+        pos_loss = None
+        if pos_labels is not None:
+            # ignore_index=-1 safely handles null POS tags without crashing CUDA
+            pos_loss = nn.CrossEntropyLoss(reduction='mean', ignore_index=-1)(
+                pos_logits.view(-1, self.num_pos_labels), pos_labels.view(-1)
+            )
+
+        # --- DYNAMIC PRECISION WEIGHTING ---
+        total_loss = None
+        if primary_loss is not None and pos_loss is not None:
+            # 🟢 NaN PROTECTION: Clamp exponents to safe FP16 boundaries
+            safe_log_var0 = torch.clamp(self.log_vars[0], min=-10.0, max=10.0)
+            safe_log_var1 = torch.clamp(self.log_vars[1], min=-10.0, max=10.0)
+
+            loss1 = torch.exp(-safe_log_var0) * primary_loss + safe_log_var0
+            loss2 = torch.exp(-safe_log_var1) * pos_loss + safe_log_var1
+            total_loss = loss1 + loss2
+            
+        return MultiTaskClassifierOutput(
+            loss=total_loss,
+            logits=logits,
+            pos_logits=pos_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            token_attn_weights=primary_token_attn_weights
         )

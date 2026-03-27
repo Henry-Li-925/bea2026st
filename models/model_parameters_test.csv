@@ -1,0 +1,13 @@
+model_name,track,pretrained_model,mtl,L1,component_order,batch_size,epochs,pred_head,layer_pool,token_pool,last_k_layer,num_heads
+mbert-base_mtl_mlp_mha_1_open_xx,open,jhu-clsp/mmBERT-base,1,xx,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mha,,1
+mbert-base_mtl_mlp_mha_1_closed_cn,closed,jhu-clsp/mmBERT-base,1,cn,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mha,,1
+mbert-base_mtl_mlp_mha_1_closed_de,closed,jhu-clsp/mmBERT-base,1,de,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mha,,1
+mbert-base_mtl_mlp_mha_1_closed_es,closed,jhu-clsp/mmBERT-base,1,es,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mha,,1
+mbert-base_mtl_mlp_mean_open_xx,open,jhu-clsp/mmBERT-base,1,xx,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mean,,
+mbert-base_mtl_mlp_mean_closed_cn,closed,jhu-clsp/mmBERT-base,1,cn,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mean,,
+mbert-base_mtl_mlp_mean_closed_de,closed,jhu-clsp/mmBERT-base,1,de,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mean,,
+mbert-base_mtl_mlp_mean_closed_es,closed,jhu-clsp/mmBERT-base,1,es,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mean,,
+mbert-base_mtl_mlp_Max_mean_open_xx,open,jhu-clsp/mmBERT-base,1,xx,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,Max,mean,,
+mbert-base_mtl_mlp_Max_mean_closed_cn,closed,jhu-clsp/mmBERT-base,1,cn,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,Max,mean,,
+mbert-base_mtl_mlp_Max_mean_closed_de,closed,jhu-clsp/mmBERT-base,1,de,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,Max,mean,,
+mbert-base_mtl_mlp_Max_mean_closed_es,closed,jhu-clsp/mmBERT-base,1,es,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,Max,mean,,

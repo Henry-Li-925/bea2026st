@@ -22,6 +22,7 @@ def main():
     # Optional flags to run steps
     parser.add_argument("--download", action="store_true",help="Download baseline models from Hugging Face Hub")
     parser.add_argument("--finetune", action="store_true", help="Run finetuning step")
+    parser.add_argument("--sweep", action="store_true", help="Run finetuning sweep")
     parser.add_argument("--predict", action="store_true", help="Run prediction step")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation step")
 
@@ -35,8 +36,14 @@ def main():
     parser.add_argument(
         "--model_params_path",
         type=Path,
-        default=MODELS_DIR / "model_parameters.csv",
+        default=MODELS_DIR / "model_parameters_final.csv",
         help="Path to model parameters CSV"
+    )
+    parser.add_argument(
+        '--n_trials',
+        type=int,
+        default=5,
+        help='Number of trials for each hyperparameter sweep'
     )
     parser.add_argument(
         "--dataset_split",
@@ -64,6 +71,7 @@ def main():
     steps=[]
     if args.download: steps.append("download")
     if args.finetune: steps.append("finetune")
+    if args.sweep: steps.append("sweep")
     if args.predict: steps.append("predict")
     if args.evaluate: steps.append("evaluate")
 
@@ -80,12 +88,22 @@ def main():
 
     # Run finetuning
     if "finetune" in steps:
-        logging.info("=== Running finetune ===")
-        run_finetune(
-            model_params_path=args.model_params_path,
-            models_to_run=args.models_to_run,
-            seed=args.seed
-        )
+        if "sweep" in steps:
+            logging.info("=== Running finetune sweep===") 
+            run_finetune(
+                model_params_path=args.model_params_path,
+                models_to_run=args.models_to_run,
+                seed=args.seed,
+                sweep=args.sweep,
+                n_trials=args.n_trials
+            )     
+        else:
+            logging.info("=== Running finetune ===")
+            run_finetune(
+                model_params_path=args.model_params_path,
+                models_to_run=args.models_to_run,
+                seed=args.seed
+            )        
 
     # Run predictions
     if "predict" in steps:

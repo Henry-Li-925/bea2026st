@@ -19,13 +19,30 @@ from utils import (
     cleanup_trainer_memory
 )
 
-from cvae import XLMRobertaCVAE, CVAEDataCollator
-from models import CloseTrack_Predictor
+# from cvae import XLMRobertaCVAE, CVAEDataCollator
+from models import (
+    CustomModel, 
+    MultiTaskCascadeCustomModel, 
+    CustomClassifierOutput, 
+    MultiTaskCustomModel,
+    MultiTaskDataCollator
+    ) 
 
 # Fixed paths 
 DATA_DIR = Path("data/")
 MODELS_DIR = Path("models/")
 PRED_DIR = Path("predictions/")
+
+pos_list = ['noun',
+ 'adverb',
+ 'adjective',
+ 'verb',
+ 'preposition',
+ 'misc',
+ 'number',
+ 'not-no',
+ 'determiner'
+ ]
 
 def run_predict(model_params_path, models_to_run, dataset_split):
     """
@@ -51,26 +68,8 @@ def run_predict(model_params_path, models_to_run, dataset_split):
         model_name = row["model_name"]
         track = row["track"]
         l1 = row["L1"]
+        mtl = True if int(row.get('mtl')) == 1 else False
         l1_datasets = ["es", "de", "cn"] if l1 == "xx" else [l1]
-
-        beta = row.get('annealing_factor')
-        z_dim = row.get('latent_dim')
-        dropout = row.get("dropout")
-        pred_head = row.get('pred_head')
-        layer_wise = row.get('layer_wise')
-        token_wise = row.get('token_wise')
-        pos_encoding = row.get('pos_encoding')
-        learned_pos = row.get('learned_pos')
-        max_seq_len = row.get('max_seq_len')
-        # Only cast if they exist, otherwise leave as None
-        if beta is not None:
-            beta = float(beta)
-        if z_dim is not None:
-            z_dim = int(z_dim)
-        if dropout is not None:
-            dropout = float(dropout)
-        if max_seq_len is not None:
-            max_seq_len = int(max_seq_len)
 
         for l1 in l1_datasets:
             try:
@@ -88,7 +87,7 @@ def run_predict(model_params_path, models_to_run, dataset_split):
                 hf_dataset = load_dataset("csv", data_files=data_files)
 
                 # Load tokenizer
-                tokenizer = AutoTokenizer.from_pretrained(row["pretrained_model"], use_fast=True)
+                tokenizer = AutoTokenizer.from_pretrained(row["pretrained_model"], use_fast=True, local_files_only=True)
                 cols_to_merge = row["component_order"].split("; ")
                 sep_token = f" {tokenizer.sep_token} " if tokenizer.sep_token else " "
 
@@ -101,14 +100,14 @@ def run_predict(model_params_path, models_to_run, dataset_split):
                     batched=True,
                     desc="Tokenizing input text",
                 )
-
-                # Itemize L1 
-                l1_to_idx = {l1:i for i, l1 in enumerate(["es", "de", "cn"])}
+                
+                # Itemize POS
+                pos_to_idx = {pos:i for i, pos in enumerate(pos_list)}
                 tokenized_ds = tokenized_ds.map(
-                    lambda x: {"l1_encode": [l1_to_idx[val] for val in x['L1']]},
+                    lambda x: {"pos_labels": [pos_to_idx[val] for val in x['en_target_pos']]},
                     batched=True,
-                    remove_columns=['L1'],
-                    desc="Itemizing L1"
+                    remove_columns=['en_target_pos'],
+                    desc="Itemizing POS tagging"
                 )
 
                 # Load the fine-tuned model
@@ -117,28 +116,24 @@ def run_predict(model_params_path, models_to_run, dataset_split):
                 if "baseline" in model_name:
                     logging.info(f"Loading Baseline Model from {model_path}")
                     model = AutoModelForSequenceClassification.from_pretrained(
-                        model_path
+                        model_path, local_files_only=True
+                    )
+                elif mtl:
+                    logging.info(f"Loading MTL Customized Model from {model_path}")
+                    model = MultiTaskCascadeCustomModel.from_pretrained(
+                        model_path, local_files_only=True
                     )
                 else:
                     logging.info(f"Loading Customized Model from {model_path}")
-                    model = CloseTrack_Predictor.from_pretrained(
-                        model_path, 
-                        dropout=dropout,
-                        latent_dim=z_dim,
-                        beta=beta,
-                        layer_wise=layer_wise,
-                        token_wise=token_wise,
-                        pred_head=pred_head,
-                        pos_encoding=pos_encoding,
-                        learned_pos=learned_pos,
-                        max_seq_len=max_seq_len
+                    model = CustomModel.from_pretrained(
+                        model_path, local_files_only=True
                     )
                         
                 model.eval()
 
                 # Initialize trainer
-                if "cvae" in model_name.lower():
-                    data_collator = CVAEDataCollator(tokenizer, custom_features=["l1_labels", "labels"])
+                if mtl:
+                    data_collator = MultiTaskDataCollator(tokenizer)
                 else:
                     data_collator = DataCollatorWithPadding(tokenizer)
                 trainer = Trainer(
