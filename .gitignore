@@ -1,0 +1,20 @@
+# Logs
+logs/
+slurm_logs/
+wandb/
+
+# Sweeps
+sweeps/
+
+# Models directory (ignore all except .csv files)
+models/*
+!models/*.csv
+
+# Shell scripts
+*.sh
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+core.python-11-1774591050-2649-3961-c0906a-s15.ufhpc.2644178
