@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define the CSV file containing your configurations
-CSV_FILE="models/model_parameters_final.csv"
+CSV_FILE="models/mtl_0422.csv"
 
 # Check if the file exists
 if [ ! -f "$CSV_FILE" ]; then
@@ -22,7 +22,7 @@ for MODEL in $MODEL_NAMES; do
     echo "=========================================================="
     
     # run python script.
-    python run_pipeline.py --predict --dataset_split both --models_to_run "$MODEL"
+    python run_pipeline.py --predict --models_to_run "$MODEL" --model_params_path $CSV_FILE --dataset_split test
     
     # Capture the exit code to know if it crashed, but let the loop continue
     if [ $? -eq 0 ]; then

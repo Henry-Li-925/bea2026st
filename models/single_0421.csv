@@ -1,0 +1,7 @@
+model_name,track,pretrained_model,mtl,L1,component_order,batch_size,epochs,pred_head,layer_pool,token_pool,last_k_layer,num_heads,run
+mbert-base_mlp_mha_1_open_xx_new,open,jhu-clsp/mmBERT-base,0,xx,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,mha,,1,new
+mbert-base_mlp_cls_open_xx_new,open,jhu-clsp/mmBERT-base,0,xx,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,cls,,,new
+mbert-base_mlp_Max_mha_last4_1_open_xx_new,open,jhu-clsp/mmBERT-base,0,xx,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,Max,mha,last4,1,new
+mbert-base_mlp_cls_closed_cn_new,closed,jhu-clsp/mmBERT-base,0,cn,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,cls,,,new
+mbert-base_mlp_cls_closed_de_new,closed,jhu-clsp/mmBERT-base,0,de,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,cls,,,new
+mbert-base_mlp_cls_closed_es_new,closed,jhu-clsp/mmBERT-base,0,es,L1_source_word; L1_context; en_target_clue; en_target_word,64,5,mlp,,cls,,,new

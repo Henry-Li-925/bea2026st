@@ -720,8 +720,8 @@ class MultiTaskCascadeCustomModel(CustomModel):
             safe_log_var0 = torch.clamp(self.log_vars[0], min=-10.0, max=10.0)
             safe_log_var1 = torch.clamp(self.log_vars[1], min=-10.0, max=10.0)
 
-            loss1 = torch.exp(-safe_log_var0) * primary_loss + safe_log_var0
-            loss2 = torch.exp(-safe_log_var1) * pos_loss + safe_log_var1
+            loss1 = 0.5*torch.exp(-safe_log_var0) * primary_loss + 0.5*safe_log_var0
+            loss2 = torch.exp(-safe_log_var1) * pos_loss + 0.5*safe_log_var1
             total_loss = loss1 + loss2
             
         return MultiTaskClassifierOutput(

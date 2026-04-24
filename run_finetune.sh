@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define the CSV file containing your configurations
-CSV_FILE="models/model_parameters_new.csv"
+CSV_FILE="models/single_0421.csv"
 
 # Check if the file exists
 if [ ! -f "$CSV_FILE" ]; then
@@ -22,7 +22,7 @@ for MODEL in $MODEL_NAMES; do
     echo "=========================================================="
     
     # Execute your python pipeline
-    python run_pipeline.py --finetune --models_to_run "$MODEL"
+    python run_pipeline.py --finetune --models_to_run "$MODEL" --model_params_path $CSV_FILE
     
     # Capture the exit code to know if it crashed, but let the loop continue
     if [ $? -eq 0 ]; then

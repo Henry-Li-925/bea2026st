@@ -2,6 +2,7 @@
 logs/
 slurm_logs/
 wandb/
+predictions/
 
 # Sweeps
 sweeps/
