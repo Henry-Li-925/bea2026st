@@ -1,0 +1,10 @@
+{
+    "model_name": "mbert-base_mtl_mlp_Max_mha_4_open_xx",
+    "run_id": "1",
+    "best_metric_score": 1.0201737880706787,
+    "hyperparameters": {
+        "learning_rate": 5e-05,
+        "weight_decay": 0.1,
+        "warmup_steps": 200
+    }
+}

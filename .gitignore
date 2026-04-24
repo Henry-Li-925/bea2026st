@@ -4,8 +4,6 @@ slurm_logs/
 wandb/
 predictions/
 
-# Sweeps
-sweeps/
 
 # Models directory (ignore all except .csv files)
 models/*

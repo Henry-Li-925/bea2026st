@@ -1,0 +1,10 @@
+{
+    "model_name": "mbert-base_mlp_cls_open_xx",
+    "run_id": "4",
+    "best_metric_score": 1.065478801727295,
+    "hyperparameters": {
+        "learning_rate": 1e-05,
+        "weight_decay": 0.1,
+        "warmup_steps": 100
+    }
+}

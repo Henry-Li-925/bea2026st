@@ -1,0 +1,10 @@
+{
+    "model_name": "mbert-base_mtl_mlp_cls_closed_cn",
+    "run_id": "2",
+    "best_metric_score": 0.9599312543869019,
+    "hyperparameters": {
+        "learning_rate": 3e-05,
+        "weight_decay": 0.0,
+        "warmup_steps": 200
+    }
+}
